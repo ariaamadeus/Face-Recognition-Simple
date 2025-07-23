@@ -1,5 +1,14 @@
 import os
+# import joblib
 import joblib
+import torch
+import dlib
+
+print(dlib.DLIB_USE_CUDA)
+print(dlib.cuda.get_num_devices())
+
+# Load model onto GPU (if available)
+
 import datetime
 import time
 import cv2
@@ -13,6 +22,9 @@ from PIL import Image, ImageTk
 import face_recognition
 from sklearn import svm
 
+print(torch.cuda.is_available())
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 model = None
 
@@ -37,12 +49,39 @@ def load_latest_model():
     latest_model = get_latest_model(-1)
     latest_model = int(latest_model) if latest_model != '' else ''
     if latest_model != None:
-        if latest_model == '':
-            model = joblib.load("model.pkl")
-        elif latest_model >= 0:
-            model = joblib.load("model%s.pkl"%(latest_model))
-        else: model = None
-    else: model = joblib.load("model.pkl")
+        try:
+            if latest_model == '':
+                model = torch.load("model.pkl", map_location=device)
+                print("Successfully loaded model.pkl with torch")
+            elif latest_model >= 0:
+                model = torch.load("model%s.pkl"%(latest_model), map_location=device)
+                print("Successfully loaded model%s.pkl with torch"%(latest_model))
+            else: model = None
+        except Exception as e:
+            print(f"Error loading model with torch: {e}")
+            try:
+                # Try loading with joblib as fallback
+                if latest_model == '':
+                    model = joblib.load("model.pkl")
+                elif latest_model >= 0:
+                    model = joblib.load("model%s.pkl"%(latest_model))
+                else: model = None
+                print("Successfully loaded model with joblib")
+            except Exception as e2:
+                print(f"Error loading model with joblib: {e2}")
+                model = None
+                print("Please retrain the model using the Train option")
+    else:
+        try:
+            model = torch.load("model.pkl", map_location=device)
+            print("Successfully loaded model.pkl with torch")
+        except Exception as e:
+            try:
+                model = joblib.load("model.pkl")
+                print("Successfully loaded model with joblib")
+            except Exception as e2:
+                model = None
+                print("Please retrain the model using the Train option")
 
 def train_svm():
     global model
@@ -72,13 +111,23 @@ def train_svm():
         # Loop through each training image for the current person
         for person_img in pix:
             # Get the face encodings for the face in each image file
-            face = face_recognition.load_image_file(
+            print("Checking image: ", person_img)
+            image = face_recognition.load_image_file(
                 "train_data/" + person + "/" + person_img)
-            face_bounding_boxes = face_recognition.face_locations(face)
-
+            
+            face_bounding_boxes = []
+            for count in range(4):
+                # Convert numpy array to PIL Image for rotation
+                pil_image = Image.fromarray(image)
+                pil_image = pil_image.rotate(90, Image.NEAREST, expand=1)
+                # Convert back to numpy array
+                image = np.array(pil_image)
+                face_bounding_boxes = face_recognition.face_locations(image)
+                if len(face_bounding_boxes) == 1:
+                    break
             # If training image contains exactly one face
             if len(face_bounding_boxes) == 1:
-                face_enc = face_recognition.face_encodings(face)[0]
+                face_enc = face_recognition.face_encodings(image)[0]
                 # Add face encoding for current image with corresponding label (name) to the training data
                 encodings.append(face_enc)
                 names.append(person)
@@ -90,7 +139,11 @@ def train_svm():
     
     model.fit(encodings, names)
 
-    joblib.dump(model,"model%s.pkl"%get_latest_model())
+
+    # joblib.dump(model,"model%s.pkl"%get_latest_model())
+    # Convert to PyTorch format before saving
+    model_path = "model%s.pkl"%get_latest_model()
+    torch.save(model, model_path)
     print("Training done in %ss"%str(datetime.timedelta(seconds=int(time.time()-start)))) #stop train stopwatch
 
 def test_svm(frame):
@@ -98,14 +151,16 @@ def test_svm(frame):
     if model == None: 
         train_svm()
     
-    start = time.time()
+    
     
     # Load the test image with unknown faces into a numpy array
     # test_image = face_recognition.load_image_file('test/test.jpg')
 
     # Find all the faces in the test image using the default HOG-based model
-    face_encodings = face_recognition.face_encodings(frame)
-    face_locations = face_recognition.face_locations(frame)
+    face_encodings = face_recognition.face_encodings(frame, model="small")
+    start = time.time()
+    face_locations = face_recognition.face_locations(frame, model="hog")
+    print(time.time()-start)
     num = len(face_locations)
     print("Number of faces detected: ", num)
 
@@ -115,7 +170,10 @@ def test_svm(frame):
     for i in range(num):
         test_image_enc = face_encodings[i]
         if model != None:
-            name = model.predict([test_image_enc])
+            # When model is loaded with torch, it's still an sklearn model, 
+            # so we need to use it with numpy arrays, not tensors
+            test_image_enc_numpy = test_image_enc.reshape(1, -1)  # Reshape for sklearn model
+            name = model.predict(test_image_enc_numpy)
         # print(name)
         list_names.append(*name)
     frame = drawRect(frame, face_locations, list_names)
